@@ -17,6 +17,11 @@ import (
 	"github.com/openbao/openbao/sdk/helper/docker"
 	"github.com/openbao/openbao/sdk/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/logical"
+
+	"github.com/openbao/openbao/api"
+	vaulthttp "github.com/openbao/openbao/http"
+	"github.com/openbao/openbao/vault"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -346,4 +351,92 @@ func testAccStepReadRole(t *testing.T, name, tags, rawVHosts string, rawVHostTop
 			return nil
 		},
 	}
+}
+
+// needs an import of vaulthttp "github.com/openbao/openbao/http"
+
+func TestBackend_RoleReadCrash(t *testing.T) {
+	// Reproducer from https://github.com/openbao/openbao/issues/97.
+
+	coreConfig := &vault.CoreConfig{
+		LogicalBackends: map[string]logical.Factory{
+			"rabbitmq": Factory,
+		},
+		EnableRaw: true,
+	}
+	cluster := vault.NewTestCluster(t, coreConfig, &vault.TestClusterOptions{
+		HandlerFunc: vaulthttp.Handler,
+	})
+	cluster.Start()
+	defer cluster.Cleanup()
+	client := cluster.Cores[0].Client
+
+	cleanup, uri := prepareRabbitMQTestContainer(t)
+	defer cleanup()
+
+	err := client.Sys().Mount("rabbitmq", &api.MountInput{
+		Type: "rabbitmq",
+	})
+	if err != nil {
+		t.Fatalf("failed to mount: %v", err)
+	}
+
+	resp, err := client.Logical().Write("rabbitmq/config/connection", map[string]interface{}{
+		"connection_uri": uri,
+		"username":       "guest",
+		"password":       "guest",
+	})
+	if err != nil {
+		t.Fatalf("bad: err: %v resp: %#v", err, resp)
+	}
+
+	resp, err = client.Logical().Write("rabbitmq/roles/newrole", map[string]interface{}{
+		"tags": "administrator",
+		"vhosts": `
+{
+  "/": {
+    "configure": ".*",
+    "write": ".*",
+    "read": ".*"
+  }
+}
+`,
+		"vhost_topics": `
+{
+    "/": {
+        "amq.topic": {
+            "write": ".*",
+            "read": ".*"
+        }
+    }
+}
+`,
+	})
+	if err != nil {
+		t.Fatalf("bad: err: %v resp: %#v", err, resp)
+	}
+
+	resp, err = client.Logical().Read("rabbitmq/roles/newrole")
+	if err != nil {
+		t.Fatalf("bad: err: %v resp: %#v", err, resp)
+	}
+	t.Logf("response: %#v", resp)
+
+	mount := findStorageMountUuid(t, client, "rabbitmq")
+	resp, err = client.Logical().Read("sys/raw/logical/" + mount + "/role/newrole")
+	if err != nil {
+		t.Fatalf("bad: err: %v resp: %#v", err, resp)
+	}
+	t.Logf("raw response: %#v", resp)
+}
+
+func findStorageMountUuid(t *testing.T, client *api.Client, mount string) string {
+	resp, err := client.Logical().Read("sys/mounts/" + mount)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.Data)
+	require.NotEmpty(t, resp.Data["uuid"])
+	pkiMount := resp.Data["uuid"].(string)
+	require.NotEmpty(t, pkiMount)
+	return pkiMount
 }
